@@ -1,0 +1,9 @@
+{:deps true
+
+ :dev-http {8787 {:root "public"
+                  :host "0.0.0.0"}}
+ 
+ :builds
+ {:app
+  {:target :browser
+   :modules {:main {:init-fn main/main}}}}}
