@@ -1,5 +1,6 @@
 (ns dev
   (:require [clojure.core.async :as a]
+            [clojure.core.match :refer [match]]
             [clj-commons.byte-streams :as bs]
             [hato.websocket :as ws]
             [charred.api :as json]
@@ -41,11 +42,19 @@
                                :subscription {:type :trades
                                               :coin symbol}}))
                    (a/go-loop [timer (a/timeout 60000)]
-                     (a/alt! [timer]
+                     (a/alt!
+                       [control-ch timer]
                        ([v p]
-                        (ws/ping! ws (-> (json/write-json-str {:method :ping})
-                                         (bs/convert java.nio.ByteBuffer)))
-                        (recur (a/timeout 60000))))))
+                        (match [v p]
+                         [_ timer]
+                         (do (ws/ping! ws (-> (json/write-json-str {:method :ping})
+                                            (bs/convert java.nio.ByteBuffer)))
+                             (recur (a/timeout 60000)))
+                         
+                         [:close control-ch]
+                         (ws/close! ws)
+                         
+                         :else (recur timer))))))
 
                  :on-pong (fn [ws data]
                             (println "PONG:" (bs/to-string data)))
@@ -54,8 +63,7 @@
                                (let [j (-> ^java.nio.HeapCharBuffer msg
                                            .array
                                            utils/read-json)]
-                                 (a/go
-                                   (a/>! events-ch j))))
+                                 (a/put! events-ch j)))
                  :on-close (fn [ws status reason]
                              (ws/send! ws
                                        (json/write-json-str
@@ -105,7 +113,8 @@
     active-conn)
   
   (reconnect [this]
-    (let [new-conn (loop [remaining-pool conn-pool retry-idx 0]
+    (let [new-conn (loop [remaining-pool conn-pool
+                          retry-idx 0]
                      (when-let [next-conn (first remaining-pool)]
                        (or (try 
                              (start! @next-conn)
@@ -131,17 +140,20 @@
                    control-ch
                    base-config))
 
-(def btc-events-ch (a/chan (a/sliding-buffer 100)))
-(def btc-status-ch (a/chan (a/sliding-buffer 10)))
-(def btc-control-ch (a/chan (a/sliding-buffer 10)))
 
-(def btc-ws (create-websocket-pool "wss://api.hyperliquid.xyz/ws" "BTC"
-                                   {} 3
-                                   {:events-ch btc-events-ch
-                                    :status-ch btc-status-ch
-                                    :control-ch btc-control-ch}))
+(comment
 
-(comment 
+  (def btc-events-ch (a/chan (a/sliding-buffer 100)))
+  (def btc-status-ch (a/chan (a/sliding-buffer 10)))
+  (def btc-control-ch (a/chan (a/sliding-buffer 10)))
+  (def btc-ws (create-websocket-pool "wss://api.hyperliquid.xyz/ws" "BTC"
+                                     {} 3
+                                     {:events-ch btc-events-ch
+                                      :status-ch btc-status-ch
+                                      :control-ch btc-control-ch}))
+
+  (start! btc-ws)
+  
   (a/go-loop []
     (when-not @(.closed btc-events-ch)
       (println (a/<! btc-events-ch))
@@ -167,7 +179,7 @@
   
   (ws/close! @(active-connection btc-ws))
 
-  (a/put! btc-control-ch :kill)
+  (a/put! btc-control-ch :close)
 
   ,)
 
