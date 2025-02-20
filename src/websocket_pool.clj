@@ -1,4 +1,4 @@
-(ns dev
+(ns websocket-pool
   (:require [clojure.core.async :as a]
             [clojure.core.match :refer [match]]
             [clj-commons.byte-streams :as bs]
@@ -41,23 +41,21 @@
                               {:method :subscribe
                                :subscription {:type :trades
                                               :coin symbol}}))
+                   
                    (a/go-loop [timer (a/timeout 60000)]
                      (a/alt!
                        [control-ch timer]
                        ([v p]
                         (match [v p]
-                         [_ timer]
-                         (do (ws/ping! ws (-> (json/write-json-str {:method :ping})
-                                            (bs/convert java.nio.ByteBuffer)))
-                             (recur (a/timeout 60000)))
+                          [_ timer]
+                          (do (ws/ping! ws (-> (json/write-json-str {:method :ping})
+                                               (bs/convert java.nio.ByteBuffer)))
+                            (recur (a/timeout 60000)))
                          
-                         [:close control-ch]
-                         (ws/close! ws)
+                          [:close control-ch]
+                          (ws/close! ws)
                          
-                         :else (recur timer))))))
-
-                 :on-pong (fn [ws data]
-                            (println "PONG:" (bs/to-string data)))
+                          :else (recur timer))))))
 
                  :on-message (fn [ws msg _]
                                (let [j (-> ^java.nio.HeapCharBuffer msg
@@ -69,8 +67,7 @@
                                        (json/write-json-str
                                         {:method :unsubscribe
                                          :subscription {:type :trades
-                                                        :coin symbol}}))
-                             (println "WebSocket closed!"))
+                                                        :coin symbol}})))
 
                  :on-error (fn [ws err]
                              (println "WS ERROR: " err)
@@ -78,17 +75,19 @@
                                                  :message err
                                                  :ws ws}))}
                 config)))))]
-      (set! conn-pool init-pool)
-      (set! active-conn @(first conn-pool))
+      (set! active-conn @(first init-pool))
+      (set! conn-pool (next init-pool))
+      (a/put! status-ch {:status :connected
+                         :conn active-conn})
       
       (a/go-loop []
         (let [[event _] (a/alts! [events-ch control-ch])]
           (case (:type event)
-            :force-restart (.reconnect this)
-            :error  (when (= (:ws event) active-conn)
+            :restart (.reconnect this)
+            :error (when (= (:ws event) active-conn)
                      (.reconnect this))
             :closed (when (= (:ws event) active-conn)
-                     (.reconnect this))
+                      (.reconnect this))
             nil))
         (when (a/<! control-ch)
           (recur)))
@@ -113,20 +112,22 @@
     active-conn)
   
   (reconnect [this]
-    (let [new-conn (loop [remaining-pool conn-pool
-                          retry-idx 0]
-                     (when-let [next-conn (first remaining-pool)]
-                       (or (try 
-                             (start! @next-conn)
-                             (catch Exception _
-                               (a/<!! (a/timeout
-                                       (min 30000
-                                            (* 1000 (Math/pow 2 retry-idx)))))))
-                           (recur (rest remaining-pool) (inc retry-idx)))))]
+    (let [[new-conn idx] (loop [remaining-pool conn-pool
+                                retry-idx 0]
+                           (when-let [next-conn (first remaining-pool)]
+                             (if-let [conn (try 
+                                             @next-conn
+                                             (catch Exception _
+                                               (a/<!! (a/timeout
+                                                       (min 30000
+                                                            (* 1000 (Math/pow 2 retry-idx)))))))]
+                               [conn retry-idx]
+                               (recur (rest remaining-pool) (inc retry-idx)))))]
       (when new-conn
         (set! active-conn new-conn)
+        (set! conn-pool (drop (inc idx) conn-pool))
         (a/put! status-ch {:status :reconnected
-                           :new-connection new-conn})))))
+                           :conn new-conn})))))
 
 (defn create-websocket-pool
   [uri symbol base-config pool-size {:keys [events-ch status-ch control-ch] :as _channels}]
@@ -151,35 +152,25 @@
                                      {:events-ch btc-events-ch
                                       :status-ch btc-status-ch
                                       :control-ch btc-control-ch}))
-
-  (start! btc-ws)
-  
+    
   (a/go-loop []
     (when-not @(.closed btc-events-ch)
       (println (a/<! btc-events-ch))
       (recur)))
-
-  (a/poll! btc-status-ch)
-
-  (a/poll! btc-events-ch)
-
-  (dotimes [_  100] (println "hi"))
-
-  @(.closed btc-events-ch)
-
-  btc-ws
-
-  (stop! btc-ws)
-
   (start! btc-ws)
+  (stop! btc-ws)
+  
+  (a/poll! btc-status-ch)
+  (a/poll! btc-events-ch)
+  @(.closed btc-events-ch)
 
   (get-status btc-ws)
 
   (reconnect btc-ws)
-  
-  (ws/close! @(active-connection btc-ws))
 
+  btc-ws
+    
   (a/put! btc-control-ch :close)
-
+  
   ,)
 
