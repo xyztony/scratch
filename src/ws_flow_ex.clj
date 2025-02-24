@@ -8,6 +8,9 @@
             [clj-commons.byte-streams :as bs]
             [utils]))
 
+(defn- next-or-empty [coll]
+  (or (and (seq coll) (next coll)) []))
+
 (defn create-websocket [uri config]
   (try
     (ws/websocket uri config)
@@ -25,17 +28,25 @@
   (flow/process
    {:describe
     (fn []
-      {:outs {:out "Channel where messages are put"}
+      {:ins {:control "Channel for control commands"}
+       :outs {:out "Channel where messages are put"}
        :workload :io
        :params {:uri "Websocket URI"
                 :symbol "Trading symbol"
-                :base-config "Base websocket configuration"}})
+                :base-config "Base websocket configuration"
+                :pool-size "Size of connection pool (default: 3)"
+                :auto-reconnect "Auto reconnect on failure (default: true)"
+                :reconnect-delay-ms "Delay before reconnection (default: 1000)"}})
 
     :init
-    (fn [{:keys [uri symbol base-config] :as args}]
-      (let [msg-ch (a/chan 1024)
+    (fn [{:keys [uri symbol base-config pool-size auto-reconnect reconnect-delay-ms] :as args}]
+      (let [pool-size (or pool-size 3)
+            auto-reconnect (if (nil? auto-reconnect) true auto-reconnect)
+            reconnect-delay-ms (or reconnect-delay-ms 1000)
+            msg-ch (a/chan 1024)
             base-ws-config
             {:on-open (fn [ws]
+                        (a/put! msg-ch {:type :connection-opened})
                         (ws/send! ws (json/write-json-str
                                       {:method :subscribe
                                        :subscription {:type :trades
@@ -55,36 +66,161 @@
                          (a/put! msg-ch {:type :connection-error
                                          :error (str err)}))}
             merged-config (merge base-config base-ws-config)
-            conn (create-websocket uri merged-config)]
+            pool-fn (create-pool pool-size)
+            conn-pool (pool-fn uri merged-config)
+            active-conn (try
+                          (create-websocket uri merged-config)
+                          (catch Exception e
+                            (a/put! msg-ch {:type :connection-error
+                                            :phase :initial
+                                            :error (str e)})
+                            nil))]
           
-        {:conn conn
+        {:active-conn active-conn
+         :conn-pool conn-pool
          :config merged-config
          :uri uri
          :symbol symbol
+         :auto-reconnect auto-reconnect
+         :reconnect-delay-ms reconnect-delay-ms
+         :reconnect-pending false
+         :retry-count 0
          ::flow/in-ports {:messages msg-ch}}))
 
     :transition
-    (fn [{:keys [conn] :as state} transition]
+    (fn [{:keys [active-conn] :as state} transition]
       (when (= transition ::flow/stop)
-        (when conn
-          (ws/close! conn)))
+        (when active-conn
+          (try
+            (ws/close! active-conn)
+            (catch Exception _))))
       state)
 
     :transform
-    (fn [state in-name msg]
-      (if (= :messages in-name)
-        [state {:out [msg]}]
+    (fn [{:keys [active-conn conn-pool uri config symbol auto-reconnect 
+                 reconnect-delay-ms reconnect-pending retry-count] :as state}
+         in-name
+         {msg-type :type :as msg}]
+      (cond
+        (= :messages in-name)
+        (let [is-error-or-close (or (= :connection-error msg-type) 
+                                    (= :connection-closed msg-type))]
+          (cond
+            (and is-error-or-close auto-reconnect (not reconnect-pending))
+            (do
+              (a/go
+                (a/<! (a/timeout reconnect-delay-ms))
+                (a/>! (get-in state [::flow/in-ports :messages]) 
+                      {:type :auto-reconnect-trigger}))
+              [(assoc state :reconnect-pending true) {:out [msg]}])
+            
+            (= :connection-opened msg-type)
+            [(assoc state :retry-count 0) {:out [msg]}]
+
+            (= :auto-reconnect-trigger msg-type)
+            (let [new-conn (try
+                             (if-let [next-conn (first conn-pool)]
+                               (force next-conn)
+                               (create-websocket uri config))
+                             (catch Exception e
+                               nil))
+                  new-pool (next-or-empty conn-pool)
+                  replenished-pool (conj new-pool (delay (create-websocket uri config)))
+                  new-retry-count (inc retry-count)]
+          
+              (if new-conn
+                [(assoc state 
+                        :active-conn new-conn
+                        :conn-pool replenished-pool
+                        :reconnect-pending false
+                        :retry-count 0)
+                 {:out [{:type :connection-auto-restarted}]}]
+            
+                ;; Failed reconnection, schedule another attempt with backoff
+                (do
+                  (when auto-reconnect
+                    (a/go
+                      (let [backoff-ms (* reconnect-delay-ms (min 10 new-retry-count))]
+                        (a/<! (a/timeout backoff-ms))
+                        (a/>! (get-in state [::flow/in-ports :messages]) 
+                                {:type :auto-reconnect-trigger}))))
+                  [(assoc state 
+                          :conn-pool replenished-pool
+                          :retry-count new-retry-count)
+                   {:out [{:type :connection-auto-restart-failed
+                           :retry-count new-retry-count}]}])))
+                        
+            :else
+            [state {:out [msg]}]))
+        
+        ;; User commands
+        (= :control in-name)
+        (let [command (:command msg)]
+          (match [command]
+            [:restart] 
+            (let [_ (when active-conn 
+                      (try (ws/close! active-conn) (catch Exception _)))
+                  new-conn (try
+                             (if-let [next-conn (first conn-pool)]
+                               (force next-conn)
+                               (create-websocket uri config))
+                             (catch Exception e
+                               nil))
+                  new-pool (next-or-empty conn-pool)
+
+                  replenished-pool (conj new-pool (delay (create-websocket uri config)))]
+              [(assoc state 
+                      :active-conn new-conn
+                      :conn-pool replenished-pool
+                      :reconnect-pending false
+                      :retry-count 0)
+               {:out [(if new-conn
+                        {:type :connection-restarted}
+                        {:type :connection-restart-failed})]}])
+            
+            [:close]
+            (do
+              (when active-conn 
+                (try (ws/close! active-conn) (catch Exception _)))
+              [(assoc state :active-conn nil) {:out [{:type :connection-closed-by-user}]}])
+            
+            [:replenish-pool]
+            (let [pool-fn (create-pool (count conn-pool))
+                  new-pool (pool-fn uri config)]
+              [(assoc state :conn-pool new-pool) {:out [{:type :pool-replenished
+                                                         :pool-size (count new-pool)}]}])
+            
+            [:status]
+            [state {:out [{:type :status
+                           :active-connection? (boolean active-conn)
+                           :pool-size (count conn-pool)
+                           :auto-reconnect auto-reconnect
+                           :retry-count retry-count}]}]
+            
+            [:set-auto-reconnect]
+            [(assoc state :auto-reconnect (boolean (:value msg))) 
+             {:out [{:type :auto-reconnect-updated
+                     :enabled (boolean (:value msg))}]}]
+            
+            :else
+            [state {:out [{:type :unknown-command
+                           :command command}]}]))
+        
+        :else
         [state]))}))
 
 (defn create-websocket-flow
-  [{:keys [uri symbol  base-config]}]
+  [{:keys [uri symbol base-config pool-size auto-reconnect reconnect-delay-ms]}]
   (let [flow-def
         {:procs
          {:pool-controller
           {:proc (connection-pool-process uri symbol base-config)
            :args {:uri uri
                   :symbol symbol
-                  :base-config base-config}}
+                  :base-config base-config
+                  :pool-size pool-size
+                  :auto-reconnect auto-reconnect
+                  :reconnect-delay-ms reconnect-delay-ms}}
           
           :message-handler
           {:proc (flow/process
@@ -121,14 +257,21 @@
     (create-websocket-flow
      {:uri "wss://api.hyperliquid.xyz/ws"
       :symbol "BTC"
-      :base-config {}}))
+      :base-config {}
+      :pool-size 3
+      :auto-reconnect true
+      :reconnect-delay-ms 1000}))
     
   (flow/pause ws-flow)
     
   (monitoring (flow/start ws-flow))
   (flow/resume ws-flow)
 
-  (flow/inject ws-flow [:message-handler :in] [{:howdy "do"}])
+  (send-command! ws-flow :restart)
+  (send-command! ws-flow :close)
+  (send-command! ws-flow :replenish-pool)
+  (send-command! ws-flow :status)
+  (send-command! ws-flow :set-auto-reconnect)
     
   (flow/ping ws-flow)
     
