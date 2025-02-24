@@ -21,7 +21,7 @@
 
 (defn connection-pool-process
   "Main process managing the websocket pool"
-  [uri symbol pool-size base-config]
+  [uri symbol base-config]
   (flow/process
    {:describe
     (fn []
@@ -29,68 +29,70 @@
        :workload :io
        :params {:uri "Websocket URI"
                 :symbol "Trading symbol"
-                :pool-size "Size of connection pool"
                 :base-config "Base websocket configuration"}})
 
     :init
-    (fn [{:keys [uri symbol pool-size base-config]}]
+    (fn [{:keys [uri symbol base-config] :as args}]
       (let [msg-ch (a/chan 1024)
             base-ws-config
             {:on-open (fn [ws]
-                        (prn "Subscribing " symbol)
-                        (ws/send! ws
-                                  (json/write-json-str
-                                   {:method :subscribe
-                                    :subscription {:type :trades
-                                                   :coin symbol}})))
+                        (ws/send! ws (json/write-json-str
+                                      {:method :subscribe
+                                       :subscription {:type :trades
+                                                      :coin symbol}})))
              :on-message (fn [ws msg _]
-                           (prn "WS MSG: " msg)
-                           (let [j (-> ^java.nio.HeapCharBuffer msg
-                                       .array
-                                       utils/read-json)]
-                             (prn "WS Msg: " j)
+                           (let [j (-> msg bs/to-string utils/read-json)]
                              (a/put! msg-ch j)))
              :on-close (fn [ws status reason]
-                         (ws/send! ws
-                                   (json/write-json-str
-                                    {:method :unsubscribe
-                                     :subscription {:type :trades
-                                                    :coin symbol}}))
+                         (ws/send! ws (json/write-json-str
+                                       {:method :unsubscribe
+                                        :subscription {:type :trades
+                                                       :coin symbol}}))
                          (a/put! msg-ch {:type :connection-closed
                                          :status status
                                          :reason reason}))
              :on-error (fn [ws err]
                          (a/put! msg-ch {:type :connection-error
-                                         :error err}))}
-            merged-config (merge base-config base-ws-config)]
+                                         :error (str err)}))}
+            merged-config (merge base-config base-ws-config)
+            conn (create-websocket uri merged-config)]
           
-        {:pool ((create-pool pool-size) uri base-config)
-         :active-conn @(create-websocket uri base-config)
+        {:conn conn
          :config merged-config
-         ::flow/in-ports {:in-messages msg-ch}}))
+         :uri uri
+         :symbol symbol
+         ::flow/in-ports {:messages msg-ch}}))
+
+    :transition
+    (fn [{:keys [conn] :as state} transition]
+      (when (= transition ::flow/stop)
+        (when conn
+          (ws/close! conn)))
+      state)
 
     :transform
     (fn [state in-name msg]
-      (prn state in-name msg)
-      (if (= :in-messages in-name)
+      (if (= :messages in-name)
         [state {:out [msg]}]
         [state]))}))
 
 (defn create-websocket-flow
-  [{:keys [uri symbol pool-size base-config]}]
+  [{:keys [uri symbol  base-config]}]
   (let [flow-def
         {:procs
          {:pool-controller
-          {:proc (connection-pool-process uri symbol pool-size base-config)
+          {:proc (connection-pool-process uri symbol base-config)
            :args {:uri uri
                   :symbol symbol
-                  :pool-size pool-size
                   :base-config base-config}}
           
           :message-handler
           {:proc (flow/process
-                  {:describe (fn [] {:ins {:in "Incoming messages"}})
-                   :transform (fn [_ _ msg] (prn "Received:" msg))})}}
+                  {:describe (fn [] {:ins {:in "Incoming messages"}
+                                     :workload :io})
+                   :transform (fn [state _ msg] 
+                                (prn "Received message:" msg)
+                                [state])})}}
 
          :conns
          [[[:pool-controller :out] [:message-handler :in]]]}]
@@ -119,20 +121,15 @@
     (create-websocket-flow
      {:uri "wss://api.hyperliquid.xyz/ws"
       :symbol "BTC"
-      :pool-size 0
       :base-config {}}))
-
-  
+    
   (flow/pause ws-flow)
-
-  
+    
   (monitoring (flow/start ws-flow))
   (flow/resume ws-flow)
 
-  (send-command! ws-flow :connect)
-  (send-command! ws-flow :disconnect)
-  (send-command! ws-flow :connect)
-  
+  (flow/inject ws-flow [:message-handler :in] [{:howdy "do"}])
+    
   (flow/ping ws-flow)
     
   (flow/stop ws-flow)
