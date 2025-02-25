@@ -6,6 +6,7 @@
             [charred.api :as json]
             [clojure.pprint :as pp]
             [clj-commons.byte-streams :as bs]
+            [tech.v3.dataset :as ds]
             [utils]))
 
 (defn- next-or-empty [coll]
@@ -209,6 +210,65 @@
         :else
         [state]))}))
 
+(defn ingestion-process
+  "Process for ingesting data into a dataset"
+  []
+  (flow/process
+   {:describe
+    (fn []
+      {:ins {:in "Channel for incoming data"
+             :control "Channel for control commands"}
+       :outs {:dataset-updates "Channel for dataset updates"
+              ;; TODO snapshots wip
+              :snapshot-trigger "Channel to trigger dataset snapshots"}
+       :workload :mixed
+       :params {:max-dataset-size "Maximum number of rows in working dataset (default: 100000)"
+                :snapshot-interval-ms "Interval between snapshots in ms (default: 300000 = 5 minutes)"}})
+
+    :init
+    (fn [{:keys [max-dataset-size snapshot-interval-ms] :as args}]
+      (let [max-size (or max-dataset-size 100000)
+            snapshot-interval (or snapshot-interval-ms 300000)
+            current-dataset [] #_(create-empty-dataset)
+            snapshot-ch (a/chan (a/sliding-buffer 1))]
+
+        ;; TODO finish impl
+        (a/go-loop []
+          (a/<! (a/timeout snapshot-interval))
+          (a/>! snapshot-ch {:type :time-based})
+          (recur))
+        
+        {:current-dataset current-dataset
+         :max-dataset-size max-size
+         :last-snapshot-time (System/currentTimeMillis)
+         ::flow/out-ports {:snapshot-timer snapshot-ch}}))
+
+    :transition
+    (fn [state transition]
+      (when (= transition ::flow/stop)
+        (when-let [timer-ch (get-in state [::flow/out-ports :snapshot-timer])]
+          (a/close! timer-ch)))
+      state)
+
+    :transform
+    (fn [{:keys [current-dataset max-dataset-size last-snapshot-time] :as state}
+         in-name
+         msg]
+      (if (= :in in-name)
+        (if (nil? msg)
+            [state]
+            (let [updated-dataset (conj current-dataset msg)
+                  row-count (count updated-dataset)
+                  trimmed-dataset (if (> row-count max-dataset-size)
+                                    (drop (- row-count max-dataset-size) updated-dataset)
+                                    updated-dataset)]
+              
+              [(assoc state :current-dataset trimmed-dataset)
+               {:dataset-updates [{:type :update
+                                   :current-dataset-size (count trimmed-dataset)}]}]))
+        
+        [state]))}))
+
 (defn create-websocket-flow
   [{:keys [uri symbol base-config pool-size auto-reconnect reconnect-delay-ms]}]
   (let [flow-def
@@ -272,9 +332,9 @@
   (send-command! ws-flow :replenish-pool)
   (send-command! ws-flow :status)
   
-  (flow/inject ws-flow [:pool-controller :control] [{:command :set-auto-reconnect :value true}])
-    
-  (flow/ping ws-flow)
+  (flow/inject ws-flow [:pool-controller :control] [{:command :set-auto-reconnect :value false}])
+  
+  (::flow/state (flow/ping-proc ws-flow :pool-controller))
     
   (flow/stop ws-flow)
   ,)
