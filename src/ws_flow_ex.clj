@@ -271,7 +271,8 @@
   (send-command! ws-flow :close)
   (send-command! ws-flow :replenish-pool)
   (send-command! ws-flow :status)
-  (send-command! ws-flow :set-auto-reconnect)
+  
+  (flow/inject ws-flow [:pool-controller :control] [{:command :set-auto-reconnect :value true}])
     
   (flow/ping ws-flow)
     
