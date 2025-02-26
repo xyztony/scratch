@@ -221,7 +221,6 @@
        :outs {:dataset-updates "Channel for dataset updates"
               ;; TODO snapshots wip
               :snapshot-trigger "Channel to trigger dataset snapshots"}
-       :workload :mixed
        :params {:max-dataset-size "Maximum number of rows in working dataset (default: 100000)"
                 :snapshot-interval-ms "Interval between snapshots in ms (default: 300000 = 5 minutes)"}})
 
@@ -263,9 +262,7 @@
                                     (drop (- row-count max-dataset-size) updated-dataset)
                                     updated-dataset)]
               
-              [(assoc state :current-dataset trimmed-dataset)
-               {:dataset-updates [{:type :update
-                                   :current-dataset-size (count trimmed-dataset)}]}]))
+              [(assoc state :current-dataset trimmed-dataset)]))
         
         [state]))}))
 
@@ -282,6 +279,10 @@
                   :auto-reconnect auto-reconnect
                   :reconnect-delay-ms reconnect-delay-ms}}
           
+          :ingestion
+          {:proc (ingestion-process)
+           :args {:max-dataset-size 1000}}
+          
           :message-handler
           {:proc (flow/process
                   {:describe (fn [] {:ins {:in "Incoming messages"}
@@ -291,7 +292,8 @@
                                 [state])})}}
 
          :conns
-         [[[:pool-controller :out] [:message-handler :in]]]}]
+         [[[:pool-controller :out] [:message-handler :in]]
+          [[:pool-controller :out] [:ingestion :in]]]}]
     
     (flow/create-flow flow-def)))
 
@@ -321,6 +323,8 @@
       :pool-size 3
       :auto-reconnect true
       :reconnect-delay-ms 1000}))
+
+  *e
     
   (flow/pause ws-flow)
     
@@ -334,7 +338,11 @@
   
   (flow/inject ws-flow [:pool-controller :control] [{:command :set-auto-reconnect :value false}])
   
-  (::flow/state (flow/ping-proc ws-flow :pool-controller))
+  (->> :ingestion
+       (flow/ping-proc ws-flow)
+       ::flow/state
+       :current-dataset
+       last)
     
   (flow/stop ws-flow)
   ,)
