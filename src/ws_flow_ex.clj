@@ -6,7 +6,6 @@
             [charred.api :as json]
             [clojure.pprint :as pp]
             [clj-commons.byte-streams :as bs]
-            [tech.v3.dataset :as ds]
             [utils]))
 
 (defn- next-or-empty [coll]
@@ -23,9 +22,122 @@
   (fn [uri base-config]
     (vec (repeatedly size #(delay (create-websocket uri base-config))))))
 
+(defn- handle-commands
+  [{:keys [active-conn conn-pool uri config symbol auto-reconnect 
+           reconnect-delay-ms reconnect-pending retry-count] :as state}
+   in-name
+   {msg-type :type :as msg}]
+  (cond
+    (= :messages in-name)
+    (let [is-error-or-close (or (= :connection-error msg-type) 
+                                (= :connection-closed msg-type))]
+      (cond
+        (and is-error-or-close auto-reconnect (not reconnect-pending))
+        (do
+          (a/go
+            (a/<! (a/timeout reconnect-delay-ms))
+            (a/>! (get-in state [::flow/in-ports :messages]) 
+                  {:type :auto-reconnect-trigger}))
+          [(assoc state :reconnect-pending true) {:out [msg]}])
+        
+        (= :connection-opened msg-type)
+        [(assoc state :retry-count 0) {:out [msg]}]
+
+        (= :auto-reconnect-trigger msg-type)
+        (let [new-conn (try
+                         (if-let [next-conn (first conn-pool)]
+                           (force next-conn)
+                           (create-websocket uri config))
+                         (catch Exception e
+                           nil))
+              new-pool (next-or-empty conn-pool)
+              replenished-pool (conj new-pool (delay (create-websocket uri config)))
+              new-retry-count (inc retry-count)]
+          
+          (if new-conn
+            [(assoc state 
+                    :active-conn new-conn
+                    :conn-pool replenished-pool
+                    :reconnect-pending false
+                    :retry-count 0)
+             {:out [{:type :connection-auto-restarted}]}]
+            
+            ;; Failed reconnection, schedule another attempt with backoff
+            (do
+              (when auto-reconnect
+                (a/go
+                  (let [backoff-ms (* reconnect-delay-ms (min 10 new-retry-count))]
+                    (a/<! (a/timeout backoff-ms))
+                    (a/>! (get-in state [::flow/in-ports :messages]) 
+                          {:type :auto-reconnect-trigger}))))
+              [(assoc state 
+                      :conn-pool replenished-pool
+                      :retry-count new-retry-count)
+               {:out [{:type :connection-auto-restart-failed
+                       :retry-count new-retry-count}]}])))
+        
+        :else
+        [state {:out [msg]}]))
+    
+    ;; User commands
+    (= :control in-name)
+    (let [command (:command msg)]
+      (match [command]
+             [:restart] 
+             (let [_ (when active-conn 
+                       (try (ws/close! active-conn) (catch Exception _)))
+                   new-conn (try
+                              (if-let [next-conn (first conn-pool)]
+                                (force next-conn)
+                                (create-websocket uri config))
+                              (catch Exception e
+                                nil))
+                   new-pool (next-or-empty conn-pool)
+
+                   replenished-pool (conj new-pool (delay (create-websocket uri config)))]
+               [(assoc state 
+                       :active-conn new-conn
+                       :conn-pool replenished-pool
+                       :reconnect-pending false
+                       :retry-count 0)
+                {:out [(if new-conn
+                         {:type :connection-restarted}
+                         {:type :connection-restart-failed})]}])
+             
+             [:close]
+             (do
+               (when active-conn 
+                 (try (ws/close! active-conn) (catch Exception _)))
+               [(assoc state :active-conn nil) {:out [{:type :connection-closed-by-user}]}])
+             
+             [:replenish-pool]
+             (let [pool-fn (create-pool (count conn-pool))
+                   new-pool (pool-fn uri config)]
+               [(assoc state :conn-pool new-pool) {:out [{:type :pool-replenished
+                                                          :pool-size (count new-pool)}]}])
+             
+             [:status]
+             [state {:out [{:type :status
+                            :active-connection? (boolean active-conn)
+                            :pool-size (count conn-pool)
+                            :auto-reconnect auto-reconnect
+                            :retry-count retry-count}]}]
+             
+             [:set-auto-reconnect]
+             [(assoc state :auto-reconnect (boolean (:value msg))) 
+              {:out [{:type :auto-reconnect-updated
+                      :enabled (boolean (:value msg))}]}]
+             
+             :else
+             [state {:out [{:type :unknown-command
+                            :command command}]}]))
+    
+    :else
+    [state]))
+
 (defn connection-pool-process
   "Main process managing the websocket pool"
-  [uri symbol base-config]
+  []
   (flow/process
    {:describe
     (fn []
@@ -52,7 +164,7 @@
                                       {:method :subscribe
                                        :subscription {:type :trades
                                                       :coin symbol}})))
-             :on-message (fn [ws msg _]
+             :on-message (fn [_ws msg _]
                            (let [j (-> msg bs/to-string utils/read-json)]
                              (a/put! msg-ch j)))
              :on-close (fn [ws status reason]
@@ -63,7 +175,7 @@
                          (a/put! msg-ch {:type :connection-closed
                                          :status status
                                          :reason reason}))
-             :on-error (fn [ws err]
+             :on-error (fn [_ws err]
                          (a/put! msg-ch {:type :connection-error
                                          :error (str err)}))}
             merged-config (merge base-config base-ws-config)
@@ -97,121 +209,26 @@
             (catch Exception _))))
       state)
 
-    :transform
-    (fn [{:keys [active-conn conn-pool uri config symbol auto-reconnect 
-                 reconnect-delay-ms reconnect-pending retry-count] :as state}
-         in-name
-         {msg-type :type :as msg}]
-      (cond
-        (= :messages in-name)
-        (let [is-error-or-close (or (= :connection-error msg-type) 
-                                    (= :connection-closed msg-type))]
-          (cond
-            (and is-error-or-close auto-reconnect (not reconnect-pending))
-            (do
-              (a/go
-                (a/<! (a/timeout reconnect-delay-ms))
-                (a/>! (get-in state [::flow/in-ports :messages]) 
-                      {:type :auto-reconnect-trigger}))
-              [(assoc state :reconnect-pending true) {:out [msg]}])
-            
-            (= :connection-opened msg-type)
-            [(assoc state :retry-count 0) {:out [msg]}]
+    :transform handle-commands}))
 
-            (= :auto-reconnect-trigger msg-type)
-            (let [new-conn (try
-                             (if-let [next-conn (first conn-pool)]
-                               (force next-conn)
-                               (create-websocket uri config))
-                             (catch Exception e
-                               nil))
-                  new-pool (next-or-empty conn-pool)
-                  replenished-pool (conj new-pool (delay (create-websocket uri config)))
-                  new-retry-count (inc retry-count)]
-          
-              (if new-conn
-                [(assoc state 
-                        :active-conn new-conn
-                        :conn-pool replenished-pool
-                        :reconnect-pending false
-                        :retry-count 0)
-                 {:out [{:type :connection-auto-restarted}]}]
-            
-                ;; Failed reconnection, schedule another attempt with backoff
-                (do
-                  (when auto-reconnect
-                    (a/go
-                      (let [backoff-ms (* reconnect-delay-ms (min 10 new-retry-count))]
-                        (a/<! (a/timeout backoff-ms))
-                        (a/>! (get-in state [::flow/in-ports :messages]) 
-                                {:type :auto-reconnect-trigger}))))
-                  [(assoc state 
-                          :conn-pool replenished-pool
-                          :retry-count new-retry-count)
-                   {:out [{:type :connection-auto-restart-failed
-                           :retry-count new-retry-count}]}])))
-                        
-            :else
-            [state {:out [msg]}]))
-        
-        ;; User commands
-        (= :control in-name)
-        (let [command (:command msg)]
-          (match [command]
-            [:restart] 
-            (let [_ (when active-conn 
-                      (try (ws/close! active-conn) (catch Exception _)))
-                  new-conn (try
-                             (if-let [next-conn (first conn-pool)]
-                               (force next-conn)
-                               (create-websocket uri config))
-                             (catch Exception e
-                               nil))
-                  new-pool (next-or-empty conn-pool)
-
-                  replenished-pool (conj new-pool (delay (create-websocket uri config)))]
-              [(assoc state 
-                      :active-conn new-conn
-                      :conn-pool replenished-pool
-                      :reconnect-pending false
-                      :retry-count 0)
-               {:out [(if new-conn
-                        {:type :connection-restarted}
-                        {:type :connection-restart-failed})]}])
-            
-            [:close]
-            (do
-              (when active-conn 
-                (try (ws/close! active-conn) (catch Exception _)))
-              [(assoc state :active-conn nil) {:out [{:type :connection-closed-by-user}]}])
-            
-            [:replenish-pool]
-            (let [pool-fn (create-pool (count conn-pool))
-                  new-pool (pool-fn uri config)]
-              [(assoc state :conn-pool new-pool) {:out [{:type :pool-replenished
-                                                         :pool-size (count new-pool)}]}])
-            
-            [:status]
-            [state {:out [{:type :status
-                           :active-connection? (boolean active-conn)
-                           :pool-size (count conn-pool)
-                           :auto-reconnect auto-reconnect
-                           :retry-count retry-count}]}]
-            
-            [:set-auto-reconnect]
-            [(assoc state :auto-reconnect (boolean (:value msg))) 
-             {:out [{:type :auto-reconnect-updated
-                     :enabled (boolean (:value msg))}]}]
-            
-            :else
-            [state {:out [{:type :unknown-command
-                           :command command}]}]))
-        
-        :else
-        [state]))}))
+(defn ^:dynamic ingest-transform
+  [{:keys [current-dataset max-dataset-size dropped] :as state} in-name msg]
+  (if (= :in in-name)
+    (if (nil? msg)
+      [state]
+      (let [updated-dataset (conj current-dataset msg)
+            row-count (count updated-dataset)
+            trimmed-dataset (if (> row-count max-dataset-size)
+                              (drop max-dataset-size updated-dataset)
+                              updated-dataset)]
+        (when (> row-count max-dataset-size) (prn "Dropped: " max-dataset-size "prev count: " row-count "time dropped: " dropped))
+        [(assoc state
+                :current-dataset trimmed-dataset
+                :dropped (if (> row-count max-dataset-size) (inc dropped) dropped))]))
+    [state]))
 
 (defn ingestion-process
-  "Process for ingesting data into a dataset"
+  "Process for ingesting data into a dataset."
   []
   (flow/process
    {:describe
@@ -239,6 +256,7 @@
         
         {:current-dataset current-dataset
          :max-dataset-size max-size
+         :dropped 0
          :last-snapshot-time (System/currentTimeMillis)
          ::flow/out-ports {:snapshot-timer snapshot-ch}}))
 
@@ -249,29 +267,16 @@
           (a/close! timer-ch)))
       state)
 
-    :transform
-    (fn [{:keys [current-dataset max-dataset-size last-snapshot-time] :as state}
-         in-name
-         msg]
-      (if (= :in in-name)
-        (if (nil? msg)
-            [state]
-            (let [updated-dataset (conj current-dataset msg)
-                  row-count (count updated-dataset)
-                  trimmed-dataset (if (> row-count max-dataset-size)
-                                    (drop (- row-count max-dataset-size) updated-dataset)
-                                    updated-dataset)]
-              
-              [(assoc state :current-dataset trimmed-dataset)]))
-        
-        [state]))}))
+    :transform ingest-transform}))
+
+(def ingestion-process-handler ingestion-process)
 
 (defn create-websocket-flow
   [{:keys [uri symbol base-config pool-size auto-reconnect reconnect-delay-ms]}]
   (let [flow-def
         {:procs
          {:pool-controller
-          {:proc (connection-pool-process uri symbol base-config)
+          {:proc (connection-pool-process)
            :args {:uri uri
                   :symbol symbol
                   :base-config base-config
@@ -281,7 +286,7 @@
           
           :ingestion
           {:proc (ingestion-process)
-           :args {:max-dataset-size 1000}}
+           :args {:max-dataset-size 10}}
           
           :message-handler
           {:proc (flow/process
@@ -314,7 +319,6 @@
   (flow/inject flow [:pool-controller :control] [{:command command}]))
 
 (comment
-    
   (def ws-flow
     (create-websocket-flow
      {:uri "wss://api.hyperliquid.xyz/ws"
@@ -324,12 +328,28 @@
       :auto-reconnect true
       :reconnect-delay-ms 1000}))
 
-  *e
-    
   (flow/pause ws-flow)
-    
+  
   (monitoring (flow/start ws-flow))
   (flow/resume ws-flow)
+  
+  (alter-var-root
+   (var ingest-transform)
+   (constantly
+    (fn [{:keys [current-dataset max-dataset-size dropped] :as state} in-name msg]
+      (if (= :in in-name)
+        (if (nil? msg)
+          [state]
+          (let [updated-dataset (conj current-dataset msg)
+                row-count (count updated-dataset)
+                trimmed-dataset (if (> row-count max-dataset-size)
+                                  (drop max-dataset-size updated-dataset)
+                                  updated-dataset)]
+            (when (> row-count max-dataset-size) (prn "Dropped: " max-dataset-size "prev count: " row-count "time dropped: " dropped))
+            [(assoc state
+                    :current-dataset trimmed-dataset
+                    :dropped (if (> row-count max-dataset-size) (inc dropped) dropped))]))
+        [state]))))
 
   (send-command! ws-flow :restart)
   (send-command! ws-flow :close)
@@ -338,11 +358,64 @@
   
   (flow/inject ws-flow [:pool-controller :control] [{:command :set-auto-reconnect :value false}])
   
-  (->> :ingestion
-       (flow/ping-proc ws-flow)
+  (flow/pause-proc ws-flow :ingestion)
+  
+  (alter-var-root #'ingest-transform
+                  (constantly
+                   (fn [{:keys [current-dataset max-dataset-size dropped] :as state} in-name msg]
+                     (if (= :in in-name)
+                       (if (nil? msg)
+                         [state]
+                         (let [updated-dataset (conj current-dataset msg)
+                               row-count (count updated-dataset)
+                               trimmed-dataset (if (> row-count max-dataset-size)
+                                                 (drop max-dataset-size updated-dataset)
+                                                 updated-dataset)]
+                           (when (> row-count max-dataset-size) (prn "times dropped: " dropped))
+                           [(assoc state
+                                   :current-dataset trimmed-dataset
+                                   :dropped 0)]))
+                       [state]))))
+
+  *e
+
+  (defn hot-reload-ingest-transform! []
+    ;; Define the new implementation
+    (let [new-implementation 
+          (fn [{:keys [current-dataset max-dataset-size dropped] :as state} in-name msg]
+            (if (= :in in-name)
+              (if (nil? msg)
+                [state]
+                (let [updated-dataset (conj current-dataset msg)
+                      row-count (count updated-dataset)
+                      trimmed-dataset (if (> row-count max-dataset-size)
+                                        (drop max-dataset-size updated-dataset)
+                                        updated-dataset)]
+                  ;; New implementation has different logging
+                  (when (> row-count max-dataset-size) 
+                    (prn "NEW IMPLEMENTATION - Dropped rows:" (- row-count max-dataset-size)
+                         "Total drops:" (inc dropped)))
+                  [(assoc state
+                          :current-dataset trimmed-dataset
+                          :dropped (if (> row-count max-dataset-size) (inc dropped) dropped))]))
+              [state]))]
+      
+      ;; Replace the var's root binding with the new implementation
+      (alter-var-root #'ingest-transform (fn [_] new-implementation))
+      
+      ;; Return confirmation
+      {:status :success
+       :message "ingest-transform hot-reloaded successfully"}))
+
+  (hot-reload-ingest-transform!)
+  
+  (->> (flow/ping-proc ws-flow :ingestion)
+
        ::flow/state
-       :current-dataset
-       last)
-    
+       :dropped
+       )
+
+  (meta #'ingest-transform)
+  
   (flow/stop ws-flow)
   ,)
