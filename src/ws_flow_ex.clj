@@ -332,82 +332,15 @@
   
   (monitoring (flow/start ws-flow))
   (flow/resume ws-flow)
-  
-  (alter-var-root
-   (var ingest-transform)
-   (constantly
-    (fn [{:keys [current-dataset max-dataset-size dropped] :as state} in-name msg]
-      (if (= :in in-name)
-        (if (nil? msg)
-          [state]
-          (let [updated-dataset (conj current-dataset msg)
-                row-count (count updated-dataset)
-                trimmed-dataset (if (> row-count max-dataset-size)
-                                  (drop max-dataset-size updated-dataset)
-                                  updated-dataset)]
-            (when (> row-count max-dataset-size) (prn "Dropped: " max-dataset-size "prev count: " row-count "time dropped: " dropped))
-            [(assoc state
-                    :current-dataset trimmed-dataset
-                    :dropped (if (> row-count max-dataset-size) (inc dropped) dropped))]))
-        [state]))))
-
+ 
   (send-command! ws-flow :restart)
   (send-command! ws-flow :close)
   (send-command! ws-flow :replenish-pool)
   (send-command! ws-flow :status)
   
-  (flow/inject ws-flow [:pool-controller :control] [{:command :set-auto-reconnect :value false}])
+  (flow/inject ws-flow [:pool-controller :control] [{:command :set-auto-reconnect :value true}])
   
   (flow/pause-proc ws-flow :ingestion)
-  
-  (alter-var-root #'ingest-transform
-                  (constantly
-                   (fn [{:keys [current-dataset max-dataset-size dropped] :as state} in-name msg]
-                     (if (= :in in-name)
-                       (if (nil? msg)
-                         [state]
-                         (let [updated-dataset (conj current-dataset msg)
-                               row-count (count updated-dataset)
-                               trimmed-dataset (if (> row-count max-dataset-size)
-                                                 (drop max-dataset-size updated-dataset)
-                                                 updated-dataset)]
-                           (when (> row-count max-dataset-size) (prn "times dropped: " dropped))
-                           [(assoc state
-                                   :current-dataset trimmed-dataset
-                                   :dropped 0)]))
-                       [state]))))
-
-  *e
-
-  (defn hot-reload-ingest-transform! []
-    ;; Define the new implementation
-    (let [new-implementation 
-          (fn [{:keys [current-dataset max-dataset-size dropped] :as state} in-name msg]
-            (if (= :in in-name)
-              (if (nil? msg)
-                [state]
-                (let [updated-dataset (conj current-dataset msg)
-                      row-count (count updated-dataset)
-                      trimmed-dataset (if (> row-count max-dataset-size)
-                                        (drop max-dataset-size updated-dataset)
-                                        updated-dataset)]
-                  ;; New implementation has different logging
-                  (when (> row-count max-dataset-size) 
-                    (prn "NEW IMPLEMENTATION - Dropped rows:" (- row-count max-dataset-size)
-                         "Total drops:" (inc dropped)))
-                  [(assoc state
-                          :current-dataset trimmed-dataset
-                          :dropped (if (> row-count max-dataset-size) (inc dropped) dropped))]))
-              [state]))]
-      
-      ;; Replace the var's root binding with the new implementation
-      (alter-var-root #'ingest-transform (fn [_] new-implementation))
-      
-      ;; Return confirmation
-      {:status :success
-       :message "ingest-transform hot-reloaded successfully"}))
-
-  (hot-reload-ingest-transform!)
   
   (->> (flow/ping-proc ws-flow :ingestion)
 
