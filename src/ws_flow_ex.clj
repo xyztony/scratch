@@ -46,10 +46,9 @@
         (= :auto-reconnect-trigger msg-type)
         (let [new-conn (try
                          (if-let [next-conn (first conn-pool)]
-                           (force next-conn)
-                           (create-websocket uri config))
-                         (catch Exception e
-                           nil))
+                           @(force next-conn)
+                           @(create-websocket uri config))
+                         (catch Exception _ nil))
               new-pool (next-or-empty conn-pool)
               replenished-pool (conj new-pool (delay (create-websocket uri config)))
               new-retry-count (inc retry-count)]
@@ -88,9 +87,9 @@
                        (try (ws/close! active-conn) (catch Exception _)))
                    new-conn (try
                               (if-let [next-conn (first conn-pool)]
-                                (force next-conn)
-                                (create-websocket uri config))
-                              (catch Exception e
+                                @(force next-conn)
+                                @(create-websocket uri config))
+                              (catch Exception _
                                 nil))
                    new-pool (next-or-empty conn-pool)
 
@@ -105,10 +104,14 @@
                          {:type :connection-restart-failed})]}])
              
              [:close]
-             (do
-               (when active-conn 
-                 (try (ws/close! active-conn) (catch Exception _)))
-               [(assoc state :active-conn nil) {:out [{:type :connection-closed-by-user}]}])
+             (if active-conn 
+               (try (ws/close! active-conn)
+                    [(assoc state :active-conn nil) {:out [{:type :connection-closed-by-user}]}]
+                    (catch Exception e
+                      (prn "There was an error closing the active connection." state e)
+                      [state]))
+               [state])
+             
              
              [:replenish-pool]
              (let [pool-fn (create-pool (count conn-pool))
@@ -182,7 +185,7 @@
             pool-fn (create-pool pool-size)
             conn-pool (pool-fn uri merged-config)
             active-conn (try
-                          (create-websocket uri merged-config)
+                          @(create-websocket uri merged-config)
                           (catch Exception e
                             (a/put! msg-ch {:type :connection-error
                                             :phase :initial
@@ -328,6 +331,8 @@
       :auto-reconnect true
       :reconnect-delay-ms 1000}))
 
+  (flow/ping ws-flow)
+  
   (flow/pause ws-flow)
   
   (monitoring (flow/start ws-flow))
@@ -338,17 +343,13 @@
   (send-command! ws-flow :replenish-pool)
   (send-command! ws-flow :status)
   
-  (flow/inject ws-flow [:pool-controller :control] [{:command :set-auto-reconnect :value true}])
+  (flow/inject ws-flow [:pool-controller :control] [{:command :set-auto-reconnect :value false}])
+
+  (->> (flow/ping-proc ws-flow :pool-controller)
+       ::flow/state)
   
   (flow/pause-proc ws-flow :ingestion)
-  
-  (->> (flow/ping-proc ws-flow :ingestion)
-
-       ::flow/state
-       :dropped
-       )
-
-  (meta #'ingest-transform)
+  (flow/resume-proc ws-flow :ingestion)
   
   (flow/stop ws-flow)
   ,)
