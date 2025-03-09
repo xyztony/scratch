@@ -1,13 +1,13 @@
 {:deps {org.clojure/clojure {:mvn/version "1.12.0"}
         org.clojure/core.match {:mvn/version "1.1.0"}
         #_#_org.clojure/core.async {:mvn/version "1.7.701"}
-        org.clojure/core.async {:git/sha "c56fd025c8fc016aa821b704ec681233aa46e982"
+        org.clojure/core.async {:git/sha "7cc715ac25b4a0f232a7fe1049f90f14ef10fd96"
                                 :git/url "https://github.com/clojure/core.async"}
         ;; http
         hato/hato {:mvn/version "1.0.0"}
 
         ;; tmd + arrow
-        techascent/tech.ml.dataset {:mvn/version "7.037"}
+        techascent/tech.ml.dataset {:mvn/version "7.052"}
         org.apache.arrow/arrow-vector {:mvn/version "18.1.0"}
         org.apache.arrow/arrow-memory-netty {:mvn/version "18.1.0"}
         com.cnuernber/jarrow {:mvn/version "1.000"}

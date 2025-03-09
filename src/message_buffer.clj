@@ -2,13 +2,13 @@
   (:require
    [clojure.core.async :as a]
    [tech.v3.resource :as resource]
-   [tick.core :as t]))
+   [tick.core :as t]
+   [medley.core :as medley]))
 
 
 (defrecord MessageBuffer [pending-batches
                           input-chan
                           flush-chan
-                          overflow-chan
                           buffer-config])
 
 (defn- flush!!
@@ -22,7 +22,7 @@
 
 (defn- start-message-processor!
   "Starts the main loop that processes incoming messages"
-  [{:keys [input-chan flush-chan overflow-chan pending-batches buffer-config] :as buffer}]
+  [{:keys [input-chan flush-chan pending-batches buffer-config] :as buffer}]
   (a/go-loop []
     (a/alt!
       input-chan
@@ -50,7 +50,7 @@
                (swap! pending-batches dissoc ts-key))
              
              flush?
-             (a/put! overflow-chan true)
+             (a/put! flush-chan true)
              
              :else nil)
            (recur))))
@@ -58,6 +58,7 @@
       flush-chan
       ([_]
        (prn "Scheduling buffer " buffer)
+       (reset! pending-batches {})
        (recur))
       
       (a/timeout 5000)
@@ -79,10 +80,9 @@
         
         input-chan (a/chan (:primary-buffer-size config))
         flush-chan (a/chan)
-        overflow-chan (a/chan)
-        
+                
         buffer (->MessageBuffer 
-                (atom {}) input-chan flush-chan overflow-chan config)]
+                (atom {}) input-chan flush-chan config)]
     
     (start-message-processor! buffer)
     
@@ -117,5 +117,6 @@
     (a/close! fake-data-loop))
 
   (force-flush! demo-buffer)
+    
   (close-chans!)
   ,)

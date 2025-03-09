@@ -5,7 +5,11 @@
             [hato.websocket :as ws]
             [charred.api :as json]
             [clj-commons.byte-streams :as bs]
-            [utils :as utils]))
+            [utils :as utils]
+            [tech.v3.dataset :as ds]
+            [medley.core :as medley]
+            [tech.v3.libs.arrow :as arrow]
+            [tick.core :as t]))
 
 (defn create-websocket [uri config]
   (try
@@ -279,7 +283,7 @@
           
           :ingestion
           {:proc (ingestion-process)
-           :args {:max-dataset-size 10}}
+           :args {:max-dataset-size 1000}}
           
           :message-handler
           {:proc (flow/process
@@ -324,9 +328,26 @@
 
   (->> (flow/ping-proc ws-flow :pool-controller)
        ::flow/state)
+
+  (require '[tech.v3.libs.arrow :as arrow])
   
+  (-> (->> (get-in (flow/ping-proc ws-flow :ingestion) [::flow/state :current-dataset])
+      concat
+      (filter #(= "trades" (get % :channel)))
+      (map #(first (get % :data)))
+      (ds/->>dataset {:key-fn keyword
+                      :parser-fn {:px :float32
+                                  :sz :float64}}))
+      (ds/select-columns [:px :sz :side :time :hash :tid])
+      (arrow/dataset->stream! (format "btc-%s.arrow" (t/format (t/formatter "YYYY-MM-dd__hh_mm_ss") (t/date-time)))))
+
+  (arrow/stream->dataset "btc-2025-03-09__03_08_37.arrow" {:text-as-strings? true :open-type :mmap})
+    
   (flow/pause-proc ws-flow :ingestion)
   (flow/resume-proc ws-flow :ingestion)
   
   (flow/stop ws-flow)
   ,)
+
+
+
