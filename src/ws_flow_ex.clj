@@ -324,12 +324,16 @@
   (send-command! ws-flow :replenish-pool)
   (send-command! ws-flow :status)
   
-  (flow/inject ws-flow [:pool-controller :control] [{:command :set-auto-reconnect :value false}])
+  (flow/inject ws-flow
+               [:pool-controller :control]
+               [{:command :set-auto-reconnect :value false}])
 
   (->> (flow/ping-proc ws-flow :pool-controller)
        ::flow/state)
 
   (require '[tech.v3.libs.arrow :as arrow])
+
+  (get-in (flow/ping-proc ws-flow :ingestion) [::flow/state :current-dataset])
   
   (-> (->> (get-in (flow/ping-proc ws-flow :ingestion) [::flow/state :current-dataset])
       concat

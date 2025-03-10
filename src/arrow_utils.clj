@@ -63,24 +63,29 @@
 
   (require '[tech.v3.dataset.reductions :as ds-reduce])
   (require '[tech.v3.dataset.rolling :refer [rolling] :as ds-roll])
-  (let [btc (arrow/stream->dataset
-             "./btc-2025-03-09__03_06_54.arrow"
+  (require '[ham-fisted.lazy-noncaching :as nfln])
+  (require '[ham-fisted.lazy-caching :as cfln])
+  (let [btc (arrow/stream->dataset-seq
+             "./btc-2025-03-10__08_25_53.arrow"
              {:key-fn keyword})]
-    #_(ds-reduce/aggregate
-       {:n-elems (ds-reduce/row-count)
-        :price-avg (ds-reduce/mean :px)
-        :price-sum (ds-reduce/sum :px)
-        :price-med (ds-reduce/prob-median :px)
-        :price-iqr (ds-reduce/prob-interquartile-range :px)
-        :n-dates (ds-reduce/count-distinct :tid :int32)}
-       btc)
-    (-> (ds/sort-by-column btc :time <)
-        (rolling {:window-type :fixed
-                  ;; :column-name :time
-                  :window-size 5
-                  :relative-window-position :left}
-                 {:max (ds-roll/max :px)})
-        (ds/head 50)
-        clojure.pprint/pprint))
+    (-> (ds-reduce/aggregate
+         {:n-elems (ds-reduce/row-count)
+          :price-avg (ds-reduce/mean :px)
+          :price-sum (ds-reduce/sum :px)
+          :price-med (ds-reduce/prob-median :px)
+          :price-iqr (ds-reduce/prob-interquartile-range :px)
+          :n-dates (ds-reduce/count-distinct :tid :int32)}
+         btc)
+        clojure.pprint/pprint)
+    ;; (prn (first btc))
+    (nfln/map (fn [ds]
+                (-> (ds/sort-by-column ds :time <)
+                    (rolling {:window-type :fixed
+                              :column-name :time
+                              :window-size 10
+                              :relative-window-position :left}
+                             {:max (ds-roll/max :px)})
+                    clojure.pprint/pprint))
+                btc))
   
   ,)
