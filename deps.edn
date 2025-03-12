@@ -8,6 +8,7 @@
 
         ;; tmd + arrow
         techascent/tech.ml.dataset {:mvn/version "7.052"}
+        com.google.guava/guava {:mvn/version "33.4.0-jre"}
         org.apache.arrow/arrow-vector {:mvn/version "18.1.0"}
         org.apache.arrow/arrow-memory-netty {:mvn/version "18.1.0"}
         com.cnuernber/jarrow {:mvn/version "1.000"}

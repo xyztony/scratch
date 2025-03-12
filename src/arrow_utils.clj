@@ -2,7 +2,7 @@
   (:require
    [tech.v3.libs.arrow :as arrow]
    [tech.v3.dataset :as ds]
-   [tech.v3.resource :as resource]
+   [tech.v3.libs.guava.cache :as cache]
    [tick.core :as t]
    [ham-fisted.lazy-noncaching :as hfnc]
    [medley.core :as medley]
@@ -14,11 +14,10 @@
   {:open-type :mmap
    :integer-datetime-types? true ; Use efficient integer representation for dates
    :text-as-strings? true ; Convert text to strings for easier handling
-   :key-fn keyword})
+   :key-fn keyword
+   :resource-type :gc})
 
-(defn file-extension
-  "Get the file extension to determine if it's an Arrow file"
-  [path]
+(defn file-extension [path]
   (when-let [filename (if (string? path)
                         path
                         (some->> path io/file .getName))]
@@ -50,8 +49,6 @@
   [date-str]
   (t/parse-date-time date-str (t/formatter "yyyy-MM-dd__HH_mm_ss")))
 
-
-
 (defn- file->pattern-matches [pattern file]
   (when-let [matches
              (and (is-file? file)
@@ -66,51 +63,85 @@
       (ticker-yyyy-mm-dd__hh_mm_ss->date (last a))
       (ticker-yyyy-mm-dd__hh_mm_ss->date (last b))))))
 
+
+(defonce ^:private arrow-file-buffer (atom {}))
+
+(defn add-file-to-buffer
+  ([path]
+   (add-file-to-buffer path path {}))
+  ([path key]
+   (add-file-to-buffer path key {}))
+  ([path key options]
+   (let [opts (merge default-options options)
+         datasets (arrow/stream->dataset-seq path opts)]
+     (swap! arrow-file-buffer assoc key
+            {:path path
+             :options opts
+             :datasets datasets
+             :added-at (System/currentTimeMillis)})
+     key)))
+
+(defn get-file-from-buffer [key] (get @arrow-file-buffer key))
+(defn current-buffered-files [] (keys @arrow-file-buffer))
+(defn clear-buffer [] (reset! arrow-file-buffer {}))
+(defn remove-file-from-buffer [key]
+  (when (get @arrow-file-buffer key)
+    (swap! arrow-file-buffer dissoc key)
+    true))
+
 (defn concat-arrow-files
-  [{:keys [process-fn arrow] :as options} paths]
+  [{:keys [process-fn arrow] :as _opts} paths]
   (let [opts (merge default-options arrow)]
     (->> paths
          (mapcat #(arrow/stream->dataset-seq % opts))
          (hfnc/map process-fn)
          (apply ds/concat))))
 
-(comment
-  (let [pattern (ticker-yyyy-mm-dd__hh_mm_ss-pattern "btc" "arrow")
-
+(defn load-ticker-files [dir ticker ext & [options]]
+  (let [pattern (ticker-yyyy-mm-dd__hh_mm_ss-pattern ticker ext)
         files-with-matches
-        (->> (file-seq (io/file "."))
-             (keep (partial file->pattern-matches pattern)))
-
-        process-fn (fn [ds] (ds/sort-by-column ds :time))]
+        (->> (file-seq (io/file dir))
+             (keep (partial file->pattern-matches pattern)))]
     (->> files-with-matches
          (sort-by :matches date-match-comp)
          (map (comp str :file))
-         (concat-arrow-files {:process-fn process-fn})))
+         (run! #(add-file-to-buffer % % options)))))
 
-  (require '[tech.v3.dataset.reductions :as ds-reduce])
-  (require '[tech.v3.dataset.rolling :refer [rolling] :as ds-roll])
-  (require '[ham-fisted.lazy-noncaching :as hfnc])
-  (require '[ham-fisted.lazy-caching :as cfln])
-  (let [btc (arrow/stream->dataset-seq
-             "./btc-2025-03-10__08_25_53.arrow"
-             {:key-fn keyword})]
-    #_(-> (ds-reduce/aggregate
-           {:n-elems (ds-reduce/row-count)
-            :price-avg (ds-reduce/mean :px)
-            :price-sum (ds-reduce/sum :px)
-            :price-med (ds-reduce/prob-median :px)
-            :price-iqr (ds-reduce/prob-interquartile-range :px)
-            :n-dates (ds-reduce/count-distinct :tid :int32)}
-           btc)
-          clojure.pprint/pprint)
-    (-> (hfnc/map (fn [ds]
-                    (ds/sort-by-column ds :time <))
-                  btc)
-        first
-        (ds/sort-by-column :time)
-        ds/concat
-        clojure.pprint/pprint))
+(defn- memoize-with-ttl [afn ttl-seconds]
+  (cache/memoize afn
+   {:access-ttl-ms (t/millis (t/of-seconds ttl-seconds))}))
 
+(defn- caching-ds-run [key ds-fn]
+  (fn [ds]
+    (let [result (ds-fn ds)
+          fn-key (gensym "caching-ds-run-")
+          memoized-fn (memoize-with-ttl ds-fn 30)]
+      (swap! arrow-file-buffer                                                               update-in [key :cache-fns]
+             (fnil conj []) {:id fn-key :fn memoized-fn})
+      result)))
+
+(defn get-cached-fn-result [key fn-key]
+  (some->> (get-in @arrow-file-buffer [key :cache-fns])
+           (medley/find-first #(= fn-key (keyword (:id %))))
+           :fn))
+
+(defn run-fn-on-buffer! [afn]
+  (dorun 
+   (->> @arrow-file-buffer
+        (medley/map-kv (fn [key {:keys [datasets]}]
+                         (hfnc/map (caching-ds-run key afn) datasets))))))
+
+(comment
+  (load-ticker-files "." "btc" "arrow")
   
-  
+  (vals @arrow-file-buffer)
+
+  (run-fn-on-buffer! (fn [ds]
+                       (ds/sort-by-column ds :time >)))
+
+  (->> (get-in @arrow-file-buffer ["./btc-2025-03-09__03_06_54.arrow" :cache-fns])
+       (medley/find-first #(not (nil? (:id %))))
+       :id)
+      
+  (clear-buffer)
   ,)
