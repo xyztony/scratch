@@ -79,10 +79,6 @@
 (defn ->hyperbox-from-point [point class-label]
   (->hyperbox point point class-label))
 
-(defn inclusion-measure [x u]
-  (dfn// (dtype/ecount u)
-         (dtype/ecount (join x u))))
-
 (defn expand-hyperbox-to-point [hyperbox point]
   (-> hyperbox
       (update :min-point meet point)
@@ -136,19 +132,65 @@
                   (partial sigmoid {:slope 6 :x0 x0})
                   #(- (* 2 x0) %))))
 
+(defn inclusion-measure
+  "calc k(x,u) = v(u)/v(xVu)"
+  [x u valuation-fn]
+  (let [joined
+        (->hyperbox
+            (join (:min-point x) (:min-point u))
+            (join (:max-point x) (:max-point u))
+            :tmp) ; TODO resolve class
+        u-val (valuation-fn u)
+        joined-val (valuation-fn joined)]
+    (if (zero? joined-val)
+      0.0
+      (/ u-val joined-val))))
+
+(defn ->flr-classifier [{:keys [valuation-fn vigilance distance-fn]}]
+  {:rules []
+   :valuation-fn valuation-fn
+   :vigilance vigilance
+   :distance-fn distance-fn
+   :bounds nil})
+
+(defn calculate-bounds
+  [points]
+  (let [dims (count (first points))
+        init-bounds (vec (repeat dims [Double/MAX_VALUE Double/MIN_VALUE]))]
+    (reduce 
+      (fn [bounds point]
+        (mapv (fn [[min-val max-val] val]
+               [(min min-val val) (max max-val val)])
+             bounds
+             point))
+      init-bounds
+      points)))
+
+(defn- update-bounds [{:keys [bounds] :as classifier} points]
+  (if (seq points)
+    (let [points->bounds (calculate-bounds points)
+          new-bounds
+          (if bounds
+            (reduce (fn [[new-min new-max] [current-min current-max]]
+                      [(min current-min new-min)
+                       (max current-max new-max)])
+                    points->bounds
+                    bounds)
+            points->bounds)]
+      (assoc classifier :bounds new-bounds))
+    classifier))
+
+(defn- calculate-inclusion-measures-at-point
+  [{:keys [rules valuation-fn] :as _classifier} point]
+  (if (empty? rules)
+    []
+    (mapv (fn [rule]
+            (inclusion-measure point rule valuation-fn))
+          rules)))
+
 ;; section 3 https://www.athanasiadis.info/assets/pdf/ijar2007.pdf
 (let [x (->hyperbox [0.1 0.2] [0.3 0.4] :b1)
       u (->hyperbox [0.4 0.7] [0.2 0.5] :b1)
       w (->hyperbox [0.4 0.8] [0.2 0.7] :b1)]
-  (prn (/ (sigmoid-valuation w)
-          (sigmoid-valuation
-           (->hyperbox
-            (join (:min-point x) (:min-point w))
-            (join (:max-point x) (:max-point w))
-            :b1))))
-  (prn (/ (sigmoid-valuation u)
-          (sigmoid-valuation
-           (->hyperbox
-            (join (:min-point x) (:min-point u))
-            (join (:max-point x) (:max-point u))
-            :b1)))))
+  (prn (inclusion-measure x u sigmoid-valuation))
+  (prn (inclusion-measure x w sigmoid-valuation)))
